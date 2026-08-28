@@ -30,15 +30,16 @@ documentation. It ships with no SAP code or binaries.
 
 ## What you can't do (yet)
 
-- Decode arbitrary user-table rows. Column-level decoding is the
-  v0.2 milestone.
+- Decode arbitrary user-table rows or infer their schema. The crate includes
+  bounded typed-row primitives, but callers must supply a proven row layout.
 - Write or modify page-store files. OpenSQLAnywhere is read-only.
 
 ## Companion projects
 
-- **[OpenQBW](https://sigilweaver.app/openqbw/docs/)** - reader for
-  Intuit QuickBooks Desktop `.QBW` files, built on top of
-  OpenSQLAnywhere. The `ApModel` deobfuscation layer is the bridge.
+- **[OpenQBW](https://sigilweaver.app/openqbw/docs/)** - research project for
+  Intuit QuickBooks Desktop `.QBW` files, built on top of OpenSQLAnywhere.
+  The `ApModel` deobfuscation layer is the bridge; OpenQBW's Enterprise 24
+  accounting extraction remains in research.
 
 ## Get started
 

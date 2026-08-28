@@ -61,6 +61,52 @@ const LEARN_PURITY: f64 = 1.0;
 /// essentially zero plaintext). We learn `bv` only from these pages.
 const PURE_AP_TYPES: [u8; 4] = [0x40, 0x43, 0x48, 0x4D]; // '@', 'C', 'H', 'M'
 
+/// Evidence collected while choosing an AP stream step for one sector.
+///
+/// This is a diagnostic, not a proof that the recovered plaintext is correct.
+/// In particular, dense sectors can have tied candidates, and structured
+/// plaintext can make an *incorrect* step produce a stronger histogram peak.
+/// Callers that need accounting-grade correctness must preserve this evidence
+/// with their row/page provenance and validate decoded values independently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApSectorRecoveryConfidence {
+    /// Zero-based sector index within the page.
+    pub sector_index: usize,
+    /// Step selected by the existing peak heuristic (the first maximum).
+    pub chosen_step: u8,
+    /// Largest candidate plaintext-histogram peak.
+    pub best_peak: usize,
+    /// Largest peak among all candidates other than [`Self::chosen_step`].
+    pub runner_up_peak: usize,
+    /// Whether another step reached [`Self::best_peak`].
+    pub best_peak_tied: bool,
+    /// Number of zero bytes in plaintext under [`Self::chosen_step`].
+    pub zero_plaintext_count: usize,
+    /// `zero_plaintext_count / sector_byte_count`.
+    pub zero_plaintext_fraction: f64,
+    /// Frequency of the most-common plaintext byte under [`Self::chosen_step`].
+    pub plaintext_peak_fraction: f64,
+    /// Number of bytes examined. The final sector excludes the plaintext trailer.
+    pub sector_byte_count: usize,
+}
+
+/// Per-page evidence from AP stream recovery.
+///
+/// The diagnostic deliberately reports observations rather than applying a
+/// correctness threshold. A nonzero [`Self::tied_sector_count`] is useful to
+/// callers, but an untied sector is not thereby authenticated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApPageRecoveryConfidence {
+    /// Zero-based page number supplied to recovery.
+    pub page_number: u64,
+    /// Calibration byte used to derive sector bases.
+    pub bv: u8,
+    /// Evidence for every AP-obfuscated sector in the page.
+    pub sectors: Vec<ApSectorRecoveryConfidence>,
+    /// Number of sectors where more than one step shared the largest peak.
+    pub tied_sector_count: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Low-level AP arithmetic
 // ---------------------------------------------------------------------------
@@ -131,10 +177,17 @@ fn sector_purity(sec: &[u8], base: u8, step: u8) -> f64 {
 /// peak is returned.  For sectors with many zero-valued plaintext bytes this
 /// reliably finds the correct step.
 ///
-/// Returns `(best_step, peak_count)`.
-fn recover_step_peak(sec: &[u8], base: u8) -> (u8, usize) {
+/// Returns the complete diagnostic used by the existing step-selection
+/// heuristic. The first maximum remains selected for compatibility.
+fn recover_step_confidence(
+    sec: &[u8],
+    base: u8,
+    sector_index: usize,
+) -> ApSectorRecoveryConfidence {
     let mut best_step = 0u8;
     let mut best_count = 0usize;
+    let mut runner_up_count = 0usize;
+    let mut best_peak_tied = false;
 
     for step in 0u8..=255 {
         let mut hist = [0u16; 256];
@@ -146,12 +199,41 @@ fn recover_step_peak(sec: &[u8], base: u8) -> (u8, usize) {
         }
         let peak = hist.iter().copied().max().unwrap_or(0) as usize;
         if peak > best_count {
+            runner_up_count = best_count;
             best_count = peak;
             best_step = step;
+            best_peak_tied = false;
+        } else {
+            runner_up_count = runner_up_count.max(peak);
+            if peak == best_count {
+                best_peak_tied = true;
+            }
         }
     }
 
-    (best_step, best_count)
+    let mut chosen_hist = [0usize; 256];
+    let mut zero_plaintext_count = 0usize;
+    for (i, &b) in sec.iter().enumerate() {
+        let plain = b
+            .wrapping_sub(base)
+            .wrapping_sub((i as u8).wrapping_mul(best_step));
+        chosen_hist[plain as usize] += 1;
+        if plain == 0 {
+            zero_plaintext_count += 1;
+        }
+    }
+    let len = sec.len();
+    ApSectorRecoveryConfidence {
+        sector_index,
+        chosen_step: best_step,
+        best_peak: best_count,
+        runner_up_peak: runner_up_count,
+        best_peak_tied,
+        zero_plaintext_count,
+        zero_plaintext_fraction: zero_plaintext_count as f64 / len as f64,
+        plaintext_peak_fraction: best_count as f64 / len as f64,
+        sector_byte_count: len,
+    }
 }
 
 /// Deobfuscate `sec` given `(base, step)`: `plain[i] = (sec[i] − base − i*step) mod 256`.
@@ -438,10 +520,25 @@ impl ApModel {
     /// only variant that's correct for dense data blocks (all-`E`-type)
     /// on files with per-page `bv`.
     pub fn deobfuscate_with_store(&self, raw: &[u8], pn: u64, store: &PageStore) -> Vec<u8> {
+        self.deobfuscate_with_store_and_confidence(raw, pn, store).0
+    }
+
+    /// Deobfuscate with per-page `bv` recovery and return AP-selection
+    /// diagnostics alongside the plaintext.
+    ///
+    /// As with [`Self::deobfuscate_with_bv_and_confidence`], confidence is
+    /// observational only. It must not be converted into an unverified
+    /// acceptance threshold for accounting records.
+    pub fn deobfuscate_with_store_and_confidence(
+        &self,
+        raw: &[u8],
+        pn: u64,
+        store: &PageStore,
+    ) -> (Vec<u8>, ApPageRecoveryConfidence) {
         let ptype = raw[TRAILER_START + 2];
         let bv = learn_bv_for_page(raw, pn, ptype)
             .unwrap_or_else(|| self.recover_bv_for_page(store, pn));
-        self.deobfuscate_with_bv(raw, pn, bv)
+        self.deobfuscate_with_bv_and_confidence(raw, pn, bv)
     }
 
     /// Deobfuscate using an explicitly supplied `bv`.
@@ -449,9 +546,27 @@ impl ApModel {
     /// The caller is responsible for supplying the correct block `bv`; the
     /// model's internal `bv_map` is not consulted.
     pub fn deobfuscate_with_bv(&self, raw: &[u8], pn: u64, bv: u8) -> Vec<u8> {
+        self.deobfuscate_with_bv_and_confidence(raw, pn, bv).0
+    }
+
+    /// Deobfuscate using an explicitly supplied `bv`, retaining the evidence
+    /// behind every sector's selected step.
+    ///
+    /// This does not change the legacy selection rule: the first step whose
+    /// plaintext histogram reaches the largest peak is used. The accompanying
+    /// diagnostic makes ties and weak/structured signals visible; it does not
+    /// certify the result. Use it when decoded values will inform accounting
+    /// output or other correctness-sensitive work.
+    pub fn deobfuscate_with_bv_and_confidence(
+        &self,
+        raw: &[u8],
+        pn: u64,
+        bv: u8,
+    ) -> (Vec<u8>, ApPageRecoveryConfidence) {
         assert!(raw.len() >= PAGE_SIZE, "page buffer too small");
 
         let mut out = vec![0u8; PAGE_SIZE];
+        let mut sectors = Vec::with_capacity(SECTORS_PER_PAGE);
 
         for si in 0..SECTORS_PER_PAGE {
             let off = si * SECTOR_SIZE;
@@ -462,12 +577,25 @@ impl ApModel {
             };
             let sec = &raw[off..data_end];
             let base = ap_base(pn, si, bv);
-            let (step, _) = recover_step_peak(sec, base);
-            apply_stream(sec, base, step, &mut out[off..data_end]);
+            let evidence = recover_step_confidence(sec, base, si);
+            apply_stream(sec, base, evidence.chosen_step, &mut out[off..data_end]);
+            sectors.push(evidence);
         }
 
         out[TRAILER_START..PAGE_SIZE].copy_from_slice(&raw[TRAILER_START..PAGE_SIZE]);
-        out
+        let tied_sector_count = sectors
+            .iter()
+            .filter(|sector| sector.best_peak_tied)
+            .count();
+        (
+            out,
+            ApPageRecoveryConfidence {
+                page_number: pn,
+                bv,
+                sectors,
+                tied_sector_count,
+            },
+        )
     }
 }
 
@@ -518,10 +646,78 @@ mod tests {
         let stored: Vec<u8> = (0..SECTOR_SIZE)
             .map(|i| base.wrapping_add((i as u8).wrapping_mul(step)))
             .collect();
-        let (recovered_step, _) = recover_step_peak(&stored, base);
+        let recovered_step = recover_step_confidence(&stored, base, 0).chosen_step;
         let mut plain = vec![0u8; SECTOR_SIZE];
         apply_stream(&stored, base, recovered_step, &mut plain);
         assert!(plain.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn sector_confidence_reports_a_clear_zero_plaintext_peak() {
+        let base = 0x55;
+        let step = 19;
+        let sec = make_ap_sector(base, step);
+
+        let confidence = recover_step_confidence(&sec, base, 3);
+        assert_eq!(confidence.sector_index, 3);
+        assert_eq!(confidence.chosen_step, step);
+        assert_eq!(confidence.best_peak, SECTOR_SIZE);
+        assert!(confidence.runner_up_peak < confidence.best_peak);
+        assert!(!confidence.best_peak_tied);
+        assert_eq!(confidence.zero_plaintext_count, SECTOR_SIZE);
+        assert_eq!(confidence.zero_plaintext_fraction, 1.0);
+        assert_eq!(confidence.plaintext_peak_fraction, 1.0);
+    }
+
+    #[test]
+    fn sector_confidence_reports_tied_step_candidates() {
+        // The first half is a step-0 stream and the second half is a step-1
+        // stream. Either interpretation has 257 occurrences of zero (the
+        // other half contributes its i=0 byte), so neither may be hidden by a
+        // deterministic first-maximum tie break.
+        let base = 0x42;
+        let mut sec = [0u8; SECTOR_SIZE];
+        for (i, stored) in sec.iter_mut().enumerate() {
+            *stored = if i < 256 {
+                base
+            } else {
+                base.wrapping_add(i as u8)
+            };
+        }
+
+        let confidence = recover_step_confidence(&sec, base, 0);
+        assert_eq!(confidence.chosen_step, 0, "first maximum stays compatible");
+        assert_eq!(confidence.best_peak, 257);
+        assert_eq!(confidence.runner_up_peak, 257);
+        assert!(confidence.best_peak_tied);
+    }
+
+    #[test]
+    fn sector_confidence_does_not_treat_a_stronger_false_peak_as_correct() {
+        // Encode a structured, nonzero plaintext using true step 7. Its own
+        // byte ramp makes step 8 appear as a perfectly constant plaintext;
+        // the peak heuristic therefore deliberately chooses the *wrong* step.
+        // The API records the observation but makes no correctness claim.
+        let base: u8 = 0x17;
+        let true_step = 7;
+        let mut sec = [0u8; SECTOR_SIZE];
+        for (i, stored) in sec.iter_mut().enumerate() {
+            let plaintext = i as u8;
+            *stored = base
+                .wrapping_add((i as u8).wrapping_mul(true_step))
+                .wrapping_add(plaintext);
+        }
+
+        let confidence = recover_step_confidence(&sec, base, 0);
+        assert_eq!(confidence.chosen_step, 8);
+        assert_eq!(confidence.best_peak, SECTOR_SIZE);
+        // The second-best candidate still has a substantial periodic peak;
+        // neither its absence nor the winner's strength would prove that the
+        // selected step is the true cipher step.
+        assert_eq!(confidence.runner_up_peak, 256);
+        assert!(!confidence.best_peak_tied);
+        assert_eq!(confidence.zero_plaintext_count, SECTOR_SIZE);
+        assert_eq!(confidence.plaintext_peak_fraction, 1.0);
     }
 
     #[test]
@@ -607,5 +803,27 @@ mod tests {
 
         let model = ApModel::default();
         assert_eq!(model.recover_bv_for_page(&store, 0), 77);
+    }
+
+    #[test]
+    fn page_confidence_preserves_sector_evidence_and_trailer() {
+        let pn = 3;
+        let bv = 77;
+        let plaintext = vec![0u8; TRAILER_START];
+        let mut raw = encode_page(pn, b'E', bv, 13, &plaintext);
+        raw[TRAILER_START] = 0xA5;
+        let (decoded, confidence) =
+            ApModel::default().deobfuscate_with_bv_and_confidence(&raw, pn, bv);
+
+        assert_eq!(decoded[..TRAILER_START], plaintext);
+        assert_eq!(decoded[TRAILER_START], 0xA5);
+        assert_eq!(confidence.page_number, pn);
+        assert_eq!(confidence.bv, bv);
+        assert_eq!(confidence.sectors.len(), SECTORS_PER_PAGE);
+        assert_eq!(
+            confidence.sectors[SECTORS_PER_PAGE - 1].sector_byte_count,
+            496
+        );
+        assert_eq!(confidence.tied_sector_count, 0);
     }
 }

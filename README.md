@@ -74,12 +74,12 @@ $ opensqlany deob Company.QBW 2
 
 ## Relationship to OpenQBW
 
-Intuit QuickBooks `.QBW` company files are SA17 page stores with a
-deterministic additive-progression obfuscation applied on top. This crate
-includes an [`ApModel`] that removes that obfuscation before handing
+Intuit QuickBooks `.QBW` company files observed by this project use an
+SA17-style page store with deterministic additive-progression obfuscation.
+This crate includes an [`ApModel`] that removes that obfuscation before handing
 plaintext pages to the rest of the API. The companion project **OpenQBW**
-builds on top of this crate to expose the QuickBooks-specific business-object
-layer.
+builds on top of this crate for QuickBooks-specific research; this crate does
+not decode QuickBooks business objects or accounting reports.
 
 ## License
 

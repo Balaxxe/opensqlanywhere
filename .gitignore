@@ -1,8 +1,16 @@
 /target
+/target-*/
+/.codex-temp/
+/.test-tmp/
 **/*.rs.bk
 Cargo.lock.bak
 
 # Local test corpora should never be committed
 /testdata/private/
+/private-artifacts/
+**/private-artifacts/
 *.db
 *.log
+*.etl
+*.raw-page.bin
+*.materialized-page.bin

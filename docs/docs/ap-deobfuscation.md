@@ -7,8 +7,8 @@ sidebar_label: AP deobfuscation
 
 Some SA17-derived stores ship with an extra obfuscation pass on top
 of the page-store layer. The most prominent example is the Intuit
-QuickBooks Desktop `.QBW` format, which is an SA17 page store with
-a deterministic additive-progression keystream XORed across each
+QuickBooks Desktop `.QBW` format, which is an SA17-style page store with a
+deterministic additive-progression keystream added modulo 256 across each
 page.
 
 `opensqlany::ApModel` is the in-memory adapter that peels this
@@ -48,13 +48,36 @@ for the specific page being decoded rather than trusting its block's
 learned value, so it stays correct either way; only the cheaper
 block-only `deobfuscate` is affected by this.
 
+## Recovery evidence for dense pages
+
+The sector step is selected by the highest repeated-byte peak in the
+candidate plaintext. That is effective for sectors with padding, but it is
+not an authenticity check: dense data can leave multiple steps tied, and a
+structured nonzero plaintext can make a false step produce a stronger peak.
+
+For correctness-sensitive callers, use the confidence-returning API and keep
+the diagnostic with page/row provenance. It reports the selected step, the
+best and runner-up peaks (including ties), and the zero and overall plaintext
+peak fractions for every sector. The library intentionally supplies no magic
+acceptance threshold; accounting extraction must validate decoded records and
+their reconciliation independently.
+
+```rust
+let (plain, confidence) = model.deobfuscate_with_store_and_confidence(
+    page.bytes(), page.index(), &store,
+);
+if confidence.tied_sector_count != 0 {
+    // Preserve the ambiguity for a higher-level validator; do not silently
+    // promote records sourced from these sectors to authoritative output.
+}
+```
+
 ## Companion: OpenQBW
 
-[OpenQBW](https://sigilweaver.app/openqbw/docs/) is the companion
-project that builds the QuickBooks business-object layer on top.
-It uses `ApModel` for the obfuscation peel, then drives
-`opensqlany` for the page walk, then layers Intuit's schema on
-top of the resulting catalog rows.
+[OpenQBW](https://sigilweaver.app/openqbw/docs/) is the companion research
+project for a QuickBooks business-object layer. It uses `ApModel` for the
+obfuscation peel and `opensqlany` for bounded page/row primitives. Its
+Enterprise 24 account and posting decoders are not yet complete.
 
 ## Full algorithm
 

@@ -20,15 +20,16 @@ project that uses OpenSQLAnywhere to read Intuit QuickBooks Desktop
 .QBW file
    |
    v
- OpenQBW         (knows QuickBooks schema, invoice extraction, migrate)
+ OpenQBW         (QuickBooks-specific research and catalog diagnostics)
    |             ^
    v             |
  opensqlany      |
    - ApModel ----+  (peel additive-progression obfuscation)
    - PageStore      (walk pages, verify CRC, parse slotted dirs)
-   - SYSTABLE       (SA17 system catalog)
+   - typed rows     (bounded primitive; caller supplies schema)
 ```
 
 OpenSQLAnywhere has no knowledge of the QuickBooks schema; it
 exposes plaintext SA17 pages and the deobfuscation primitive.
-OpenQBW provides the rest.
+OpenQBW provides the QuickBooks-specific research layer. It does not yet
+provide a completed Enterprise 24 accounting extractor.

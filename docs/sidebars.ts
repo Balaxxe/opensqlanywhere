@@ -19,6 +19,7 @@ const sidebars: SidebarsConfig = {
             items: [
                 'specification',
                 'ap-deobfuscation',
+                'row-segments',
             ],
         },
         {

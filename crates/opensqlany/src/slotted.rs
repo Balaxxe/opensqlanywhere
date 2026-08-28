@@ -2,8 +2,9 @@
 //!
 //! SA17 catalog and data pages use the classic slotted-page layout: a
 //! header region at the start of the page, row bodies growing down from
-//! near the page end, and a descending array of little-endian u16 row
-//! offsets that points at each row body.
+//! near the page end, and a descending array of u16 row offsets that points
+//! at each row body. Both little-endian and big-endian arrays occur in
+//! QuickBooks Enterprise 24 files.
 //!
 //! Observed quirks (see `SPECIFICATION.md §6`):
 //!
@@ -35,6 +36,8 @@ pub struct SlotDirectory {
     pub slots: Vec<u16>,
     /// `true` iff a `0x0000` sentinel word preceded the array.
     pub leading_zero: bool,
+    /// `true` when the slot words were stored in big-endian byte order.
+    pub big_endian: bool,
 }
 
 impl SlotDirectory {
@@ -138,17 +141,26 @@ fn u16le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
+fn u16be(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([buf[off], buf[off + 1]])
+}
+
 fn is_slot_offset(value: u16) -> bool {
     (SLOT_OFFSET_MIN..SLOT_OFFSET_MAX).contains(&value)
 }
 
-fn scan_from(plain: &[u8], start: usize) -> Option<SlotDirectory> {
+fn scan_from(plain: &[u8], start: usize, big_endian: bool) -> Option<SlotDirectory> {
     let mut pos = start;
     let mut leading_zero = false;
     let mut slots: Vec<u16> = Vec::new();
     let mut prev: u32 = 0x10000;
 
-    if pos + 3 < SEARCH_LIMIT && u16le(plain, pos) == 0 && is_slot_offset(u16le(plain, pos + 2)) {
+    let read_u16 = if big_endian { u16be } else { u16le };
+
+    if pos + 3 < SEARCH_LIMIT
+        && read_u16(plain, pos) == 0
+        && is_slot_offset(read_u16(plain, pos + 2))
+    {
         leading_zero = true;
         pos += 2;
     }
@@ -157,7 +169,7 @@ fn scan_from(plain: &[u8], start: usize) -> Option<SlotDirectory> {
     let mut seen_live = false;
 
     while pos + 1 < SEARCH_LIMIT {
-        let value = u16le(plain, pos);
+        let value = read_u16(plain, pos);
         if value == 0 && seen_live {
             slots.push(0);
             pos += 2;
@@ -178,33 +190,123 @@ fn scan_from(plain: &[u8], start: usize) -> Option<SlotDirectory> {
         return None;
     }
 
+    // A slot directory lives before the row bodies it describes.  Without
+    // this check, arbitrary low-valued u16 sequences can look like a valid
+    // descending directory even though the directory itself overwrites the
+    // first purported row.
+    let min_offset = slots.iter().copied().filter(|&slot| slot != 0).min()? as usize;
+    if pos > min_offset {
+        return None;
+    }
+
     Some(SlotDirectory {
         scan_start: start,
         array_start,
         end: pos,
         slots,
         leading_zero,
+        big_endian,
     })
 }
 
 fn find_slot_directory(plain: &[u8]) -> Option<SlotDirectory> {
     let mut best: Option<SlotDirectory> = None;
     for start in 0..SEARCH_LIMIT {
-        let Some(cand) = scan_from(plain, start) else {
-            continue;
-        };
-        let better = match &best {
-            None => true,
-            Some(b) => {
-                let cand_live = cand.slots.iter().filter(|&&s| s != 0).count();
-                let best_live = b.slots.iter().filter(|&&s| s != 0).count();
-                cand_live > best_live
-                    || (cand_live == best_live && cand.slots.len() > b.slots.len())
+        // Try little-endian first to preserve the parser's established tie
+        // breaking behavior on pages where both interpretations are plausible.
+        for big_endian in [false, true] {
+            let Some(cand) = scan_from(plain, start, big_endian) else {
+                continue;
+            };
+            let better = match &best {
+                None => true,
+                Some(b) => {
+                    let cand_live = cand.slots.iter().filter(|&&s| s != 0).count();
+                    let best_live = b.slots.iter().filter(|&&s| s != 0).count();
+                    cand_live > best_live
+                        || (cand_live == best_live && cand.slots.len() > b.slots.len())
+                }
+            };
+            if better {
+                best = Some(cand);
             }
-        };
-        if better {
-            best = Some(cand);
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn put_slots(page: &mut [u8], start: usize, slots: &[u16], big_endian: bool) {
+        for (index, slot) in slots.iter().enumerate() {
+            let offset = start + index * 2;
+            let bytes = if big_endian {
+                slot.to_be_bytes()
+            } else {
+                slot.to_le_bytes()
+            };
+            page[offset..offset + 2].copy_from_slice(&bytes);
+        }
+    }
+
+    #[test]
+    fn rejects_directory_that_overlaps_its_first_live_row() {
+        let mut page = vec![0_u8; 4096];
+        // The directory occupies 20..36, but its smallest claimed row starts
+        // at 33, inside the directory itself.
+        put_slots(&mut page, 20, &[40, 39, 38, 37, 36, 35, 34, 33], false);
+
+        assert!(scan_from(&page, 20, false).is_none());
+    }
+
+    #[test]
+    fn keeps_valid_directory_when_an_overlapping_false_one_precedes_it() {
+        let mut page = vec![0_u8; 4096];
+        put_slots(&mut page, 20, &[40, 39, 38, 37, 36, 35, 34, 33], false);
+        put_slots(
+            &mut page,
+            200,
+            &[1000, 950, 900, 850, 800, 750, 700, 650],
+            false,
+        );
+        // A non-slot metadata word terminates the otherwise-zero-filled
+        // synthetic directory.
+        page[216..218].copy_from_slice(&u16::MAX.to_le_bytes());
+
+        let directory = find_slot_directory(&page).expect("valid directory");
+        assert_eq!(directory.array_start, 200);
+        assert_eq!(directory.end, 216);
+        assert_eq!(directory.min_offset(), Some(650));
+        assert!(!directory.big_endian);
+    }
+
+    #[test]
+    fn parses_big_endian_directory_and_preserves_its_byte_order() {
+        let mut page = vec![0_u8; 4096];
+        put_slots(
+            &mut page,
+            0,
+            &[
+                0x0ea1, 0x0e84, 0x0e67, 0x0e4a, 0x0e2d, 0x0e10, 0x0df3, 0x0dd6,
+            ],
+            true,
+        );
+        page[16..18].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        let directory = find_slot_directory(&page).expect("big-endian directory");
+        assert_eq!(directory.array_start, 0);
+        assert_eq!(directory.slots[0], 0x0ea1);
+        assert_eq!(directory.min_offset(), Some(0x0dd6));
+        assert!(directory.big_endian);
+    }
+
+    #[test]
+    fn rejects_big_endian_directory_that_overlaps_its_first_live_row() {
+        let mut page = vec![0_u8; 4096];
+        put_slots(&mut page, 20, &[40, 39, 38, 37, 36, 35, 34, 33], true);
+
+        assert!(scan_from(&page, 20, true).is_none());
+    }
 }

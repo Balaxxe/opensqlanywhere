@@ -12,11 +12,11 @@
 //!
 //! # Scope
 //!
-//! This release (v0.1) covers the **page-store layer only**: opening a file,
-//! iterating pages, validating integrity, classifying pages by type,
-//! decoding slotted-page directories, and removing the AP fill cipher.
-//! System catalog parsing (`SYSTABLE`/`SYSCOLUMN`/`SYSINDEX` rows and
-//! typed column values) is planned for a later release.
+//! This release (v0.1) covers the page-store layer plus conservative,
+//! schema-driven typed-row and page-link primitives. It does not discover
+//! table ownership, resolve overflow/LONG values, or interpret an application
+//! catalog; those responsibilities remain with a dialect-specific caller such
+//! as OpenQBW.
 //!
 //! # Example
 //!
@@ -40,14 +40,48 @@
 
 mod ap;
 mod error;
+mod materialized_page;
 mod page;
+mod page_links;
+mod page_permutation;
+mod row_decoder;
+mod row_segment;
 mod slotted;
 mod store;
 mod superblock;
 
-pub use ap::{ApModel, SECTOR_SIZE, SECTORS_PER_PAGE};
+pub use ap::{
+    ApModel, ApPageRecoveryConfidence, ApSectorRecoveryConfidence, SECTOR_SIZE, SECTORS_PER_PAGE,
+};
 pub use error::{Error, Result};
+pub use materialized_page::{
+    MATERIALIZED_TABLE_PAGE_LEN, MATERIALIZED_TABLE_PAGE_TYPE, MaterializedPageError,
+    MaterializedRecord, MaterializedRowRecord, MaterializedTablePage,
+};
 pub use page::{PAGE_SIZE, Page, PageTrailer, PageType};
+pub use page_links::{
+    PageLinkMetadata, PageLinkTarget, PageLinkWalk, PageLinkWalkStop, find_page_link_metadata,
+    walk_page_links,
+};
+pub use page_permutation::{
+    PAGE_PERMUTATION_SECTOR_LEN, PagePermutationError, permute_power_of_two_in_place,
+    permute_sector_in_place,
+};
+pub use row_decoder::{
+    BooleanTailLayout, ColumnDef, ColumnType, Decimal, DecodeError, DecodedRow,
+    EnterpriseNumericToken, EnumLayout, NullBitmapCoverage, NullBitmapLayout, NumericLayout,
+    PartialDecodedRow, PartialRowValue, ROW_FLAG_OVERFLOW, ROW_FLAG_REFERENCE,
+    ROW_FLAG_REFERENCE_DESTINATION, ROW_SIZE_MASK, RowPrefixLayout, RowSchema, SaDate, SaDateTime,
+    Value, VariableLengthLayout, VariableOverflowLayout, decode_materialized_row_record_exact,
+    decode_row, decode_row_exact, decode_row_prefix_and_boolean_tail, legacy_syscolumn_schema,
+    legacy_systable_schema,
+};
+pub use row_segment::{
+    CONTINUED_ROW_SEGMENT_HEADER_LEN, ContinuationTarget, ROW_SEGMENT_CONTINUED,
+    ROW_SEGMENT_HEADER_LEN, RowSegment, RowSegmentChain, RowSegmentChainError,
+    RowSegmentChainLimits, RowSegmentChainSegment, RowSegmentError, parse_row_segment,
+    walk_row_segment_chain,
+};
 pub use slotted::{SlotDirectory, SlottedPage};
 pub use store::{PageStore, Pages};
 pub use superblock::{SA_COPYRIGHT_MARKER, SA_MAGIC, Superblock};

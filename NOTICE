@@ -13,3 +13,13 @@ You may obtain a copy of the License at
 SQL Anywhere(R) is a registered trademark of SAP SE.
 OpenSQLAnywhere is an independent project and is not affiliated
 with, endorsed by, or sponsored by SAP SE.
+
+The SQL Anywhere typed-row decoder was informed by the independently
+developed DBReader project:
+
+    DBReader
+    Copyright (c) 2024 Sergey Bodrov
+    https://github.com/serbod/DBReader
+
+DBReader is licensed under the MIT License. A copy is provided in
+THIRD_PARTY_LICENSES/DBReader-MIT.txt.

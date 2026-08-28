@@ -13,7 +13,7 @@ opensqlany = "0.1"
 
 ## What it does
 
-- Open any SA17 `.db` or `.qbw` file
+- Open observed SA17-style `.db` or `.qbw` page-store files
 - Iterate over 4 KiB pages
 - Validate per-page CRC-32 footers
 - Classify pages by type (`'E'` extent, `'A'` alloc, `'I'` index, ...)
@@ -45,8 +45,10 @@ v0.1 covers the **page-store layer**: opening, iterating, CRC validation,
 page-type classification, slotted-page directory parsing, and AP
 deobfuscation.
 
-System catalog parsing (`SYSTABLE` / `SYSCOLUMN` / `SYSINDEX`),
-B-tree traversal, and typed row decoding are planned for a later release.
+The crate also provides bounded, fail-closed typed-row decoding primitives for
+callers that already possess a proven row layout. It does not provide a
+universal SA17 schema decoder, catalog traversal, or B-tree traversal. Those
+remain caller- and dialect-specific work.
 
 ## License
 

@@ -170,8 +170,9 @@ impl PageType {
     /// Classification is case-insensitive: some files (observed on
     /// QuickBooks Enterprise 24.0) carry a lowercase page-type byte (e.g.
     /// `'e'` 0x65 rather than `'E'` 0x45) on otherwise-ordinary extent
-    /// pages. The original byte is preserved in [`PageType::Other`] so the
-    /// case distinction - which may itself be meaningful - isn't discarded.
+    /// pages. This classification intentionally normalizes case; callers
+    /// that need the exact physical byte must retain
+    /// [`PageTrailer::page_type_raw`].
     #[inline]
     pub fn from_byte(b: u8) -> Self {
         match b.to_ascii_uppercase() {
@@ -202,7 +203,10 @@ impl PageType {
         }
     }
 
-    /// The raw byte at trailer offset `0xFF2`.
+    /// The canonical uppercase byte for this classification.
+    ///
+    /// For the exact physical byte (including lowercase variants), use
+    /// [`PageTrailer::page_type_raw`] instead.
     pub fn as_byte(&self) -> u8 {
         match self {
             PageType::Extent => b'E',
@@ -215,5 +219,27 @@ impl PageType {
             PageType::UnknownG => b'G',
             PageType::Other(b) => *b,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowercase_types_classify_normally_but_trailer_retains_the_raw_byte() {
+        assert_eq!(PageType::from_byte(b'e'), PageType::Extent);
+        assert_eq!(PageType::from_byte(b'e').as_byte(), b'E');
+        let trailer = PageTrailer {
+            flag_ff0: 0,
+            flag_ff1: 0,
+            page_type_raw: b'e',
+            zero_ff3: 0,
+            meta_ff4: 0,
+            meta_ff5: 0,
+            zero_ff6: [0; 6],
+        };
+        assert_eq!(trailer.page_type(), PageType::Extent);
+        assert_eq!(trailer.page_type_raw, b'e');
     }
 }

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -21,22 +21,9 @@ impl PageStore {
     /// Open a page store by path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let mut f = File::open(path)?;
-        let size = f.seek(SeekFrom::End(0))?;
-        f.seek(SeekFrom::Start(0))?;
-
-        if size < PAGE_SIZE as u64 {
-            return Err(Error::TooSmall { size });
-        }
-        if !size.is_multiple_of(PAGE_SIZE as u64) {
-            return Err(Error::NotPageAligned {
-                size,
-                page_size: PAGE_SIZE,
-            });
-        }
-
-        let mut bytes = Vec::with_capacity(size as usize);
-        f.read_to_end(&mut bytes)?;
-        Ok(PageStore { bytes })
+        Ok(PageStore {
+            bytes: read_size_stable_snapshot(&mut f)?,
+        })
     }
 
     /// Wrap an already-materialised byte buffer as a page store.
@@ -111,6 +98,60 @@ impl PageStore {
     }
 }
 
+/// Read exactly one size-stable, page-aligned file snapshot.
+///
+/// Keeping this generic allows deterministic tests for growth/truncation
+/// without using corpus files.  The reader is bounded to its initial length;
+/// a later length check rejects growth or truncation while it was read. This
+/// cannot detect same-length in-place rewrites; callers that need an atomic
+/// content snapshot must supply an immutable copy or external file locking.
+fn read_size_stable_snapshot<R: Read + Seek>(reader: &mut R) -> Result<Vec<u8>> {
+    let initial_size = reader.seek(SeekFrom::End(0))?;
+    validate_store_size(initial_size)?;
+    let capacity = usize::try_from(initial_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "page-store size does not fit this platform's address space",
+        )
+    })?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "unable to allocate page-store snapshot",
+        )
+    })?;
+    bytes.resize(capacity, 0);
+    reader.read_exact(&mut bytes)?;
+
+    let final_size = reader.seek(SeekFrom::End(0))?;
+    if final_size != initial_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "page-store changed while its snapshot was read",
+        )
+        .into());
+    }
+    // This is redundant for an unchanged file, but makes the size-stable
+    // contract explicit if validation rules evolve.
+    validate_store_size(final_size)?;
+    Ok(bytes)
+}
+
+fn validate_store_size(size: u64) -> Result<()> {
+    if size < PAGE_SIZE as u64 {
+        return Err(Error::TooSmall { size });
+    }
+    if !size.is_multiple_of(PAGE_SIZE as u64) {
+        return Err(Error::NotPageAligned {
+            size,
+            page_size: PAGE_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Iterator returned by [`PageStore::pages`].
 #[derive(Debug)]
 pub struct Pages<'a> {
@@ -137,3 +178,61 @@ impl<'a> Iterator for Pages<'a> {
 }
 
 impl<'a> ExactSizeIterator for Pages<'a> {}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read, Result as IoResult, Seek, SeekFrom};
+
+    use super::*;
+
+    #[test]
+    fn size_stable_snapshot_reads_exactly_one_page() {
+        let mut input = Cursor::new(vec![0_u8; PAGE_SIZE]);
+        assert_eq!(
+            read_size_stable_snapshot(&mut input).unwrap().len(),
+            PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn size_stable_snapshot_rejects_unaligned_initial_size() {
+        let mut input = Cursor::new(vec![0_u8; PAGE_SIZE + 1]);
+        assert!(matches!(
+            read_size_stable_snapshot(&mut input),
+            Err(Error::NotPageAligned { .. })
+        ));
+    }
+
+    struct GrowingReader {
+        inner: Cursor<Vec<u8>>,
+        read_started: bool,
+    }
+
+    impl Read for GrowingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
+            self.read_started = true;
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for GrowingReader {
+        fn seek(&mut self, position: SeekFrom) -> IoResult<u64> {
+            if matches!(position, SeekFrom::End(0)) && self.read_started {
+                return Ok((PAGE_SIZE * 2) as u64);
+            }
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn size_stable_snapshot_rejects_growth_after_the_bounded_read() {
+        let mut input = GrowingReader {
+            inner: Cursor::new(vec![0_u8; PAGE_SIZE]),
+            read_started: false,
+        };
+        assert!(matches!(
+            read_size_stable_snapshot(&mut input),
+            Err(Error::Io(_))
+        ));
+    }
+}

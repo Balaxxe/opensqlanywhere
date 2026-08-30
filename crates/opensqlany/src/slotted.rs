@@ -86,6 +86,19 @@ impl<'a> SlottedPage<'a> {
     /// neighbouring slot and the start of the trailer. This is a
     /// best-effort slicing - it does not yet decode any row header.
     pub fn row_bytes(&self) -> Vec<(u16, &'a [u8])> {
+        self.row_slots()
+            .into_iter()
+            .map(|(_, offset, bytes)| (offset, bytes))
+            .collect()
+    }
+
+    /// Return each live row with its original zero-based directory index,
+    /// offset, and bytes in slot-array order.
+    ///
+    /// This is the diagnostic-safe variant of [`Self::row_bytes`]: deleted
+    /// zero entries are omitted from its results but still count toward later
+    /// `slot_index` values.
+    pub fn row_slots(&self) -> Vec<(usize, u16, &'a [u8])> {
         let Some(dir) = &self.directory else {
             return Vec::new();
         };
@@ -96,7 +109,11 @@ impl<'a> SlottedPage<'a> {
         let mut live: Vec<u16> = dir.live_slots().collect();
         live.sort_unstable();
 
-        let mut out = Vec::with_capacity(live.len());
+        // Derive each distinct offset's bounds from physical address order,
+        // then emit them in the original slot-array order.  Directory index
+        // is an identity used by diagnostics; sorting the output silently
+        // relabelled physical slots.
+        let mut bounds = Vec::with_capacity(live.len());
         for (i, &off) in live.iter().enumerate() {
             let start = off as usize;
             let end = live
@@ -104,24 +121,35 @@ impl<'a> SlottedPage<'a> {
                 .map(|n| *n as usize)
                 .unwrap_or(TRAILER_START);
             if start < end && end <= TRAILER_START {
-                out.push((off, &bytes[start..end]));
+                bounds.push((off, start, end));
             }
         }
-        out
+        dir.slots
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(slot_index, off)| {
+                (off != 0).then_some(())?;
+                bounds
+                    .iter()
+                    .find(|(bound_offset, _, _)| *bound_offset == off)
+                    .map(|(_, start, end)| (slot_index, off, &bytes[*start..*end]))
+            })
+            .collect()
     }
 
-    /// Return the page-boundary overflow prefix, if present.
+    /// Return the non-zero page prefix before the slot directory, if present.
     ///
-    /// When a QB record spans two SA17 pages the tail fragment is written at
-    /// `page[0x000..array_start)` - before the slot directory - on the page
-    /// that contains the next records. No slot points to this region, so it is
-    /// invisible to [`SlottedPage::row_bytes`].
+    /// This region can contain ordinary page header or prelude metadata. The
+    /// presence of non-zero bytes alone is not evidence of a row continuation,
+    /// and callers must retain it as unclassified physical structure unless an
+    /// independent format witness establishes stronger semantics. No slot
+    /// points to this region, so it is invisible to [`SlottedPage::row_bytes`].
     ///
     /// Returns `Some(bytes)` when the bytes before the slot directory are
-    /// non-zero (i.e. contain row continuation data).  Returns `None` when
-    /// there is no slot directory or the prefix region is all zeros (clean
-    /// page start).
-    pub fn overflow_prefix(&self) -> Option<&'a [u8]> {
+    /// non-zero. Returns `None` when there is no slot directory or the prefix
+    /// region is all zeros.
+    pub fn unclassified_prefix(&self) -> Option<&'a [u8]> {
         let dir = self.directory.as_ref()?;
         let end = dir.array_start;
         if end == 0 {
@@ -134,6 +162,17 @@ impl<'a> SlottedPage<'a> {
         } else {
             Some(prefix)
         }
+    }
+
+    /// Historical name for [`Self::unclassified_prefix`].
+    ///
+    /// Non-zero prefix bytes are not, by themselves, continuation evidence.
+    #[deprecated(
+        since = "0.1.2",
+        note = "use unclassified_prefix; the bytes do not prove row continuation"
+    )]
+    pub fn overflow_prefix(&self) -> Option<&'a [u8]> {
+        self.unclassified_prefix()
     }
 }
 
@@ -308,5 +347,59 @@ mod tests {
         put_slots(&mut page, 20, &[40, 39, 38, 37, 36, 35, 34, 33], true);
 
         assert!(scan_from(&page, 20, true).is_none());
+    }
+
+    #[test]
+    fn row_bytes_preserves_slot_array_order_while_using_address_order_for_bounds() {
+        let mut page = vec![0_u8; 4096];
+        let slots = [400_u16, 300, 200, 100, 90, 80, 70, 60];
+        put_slots(&mut page, 0, &slots, false);
+        page[16..18].copy_from_slice(&u16::MAX.to_le_bytes());
+        page[60..70].fill(1);
+        page[70..80].fill(2);
+        page[80..90].fill(3);
+        page[90..100].fill(4);
+        page[100..200].fill(5);
+        page[200..300].fill(6);
+        page[300..400].fill(7);
+        page[400..TRAILER_START].fill(8);
+
+        let parsed = SlottedPage::parse(Page::from_bytes(0, &page));
+        let rows = parsed.row_bytes();
+        assert_eq!(
+            rows.iter().map(|(offset, _)| *offset).collect::<Vec<_>>(),
+            slots
+        );
+        assert_eq!(rows[0].1, &page[400..TRAILER_START]);
+        assert_eq!(rows[7].1, &page[60..70]);
+        assert_eq!(
+            parsed
+                .row_slots()
+                .iter()
+                .map(|(slot_index, _, _)| *slot_index)
+                .collect::<Vec<_>>(),
+            (0..slots.len()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn row_slots_retains_indices_after_deleted_entries() {
+        let mut page = vec![0_u8; 4096];
+        put_slots(
+            &mut page,
+            0,
+            &[400, 300, 0, 200, 100, 90, 80, 70, 60],
+            false,
+        );
+        page[18..20].copy_from_slice(&u16::MAX.to_le_bytes());
+        let parsed = SlottedPage::parse(Page::from_bytes(0, &page));
+        assert_eq!(
+            parsed
+                .row_slots()
+                .iter()
+                .map(|(slot_index, _, _)| *slot_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 3, 4, 5, 6, 7, 8],
+        );
     }
 }

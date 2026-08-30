@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `opensqlany inspect --verify-crc` now verifies page 0 as well as ordinary
+  pages and exits unsuccessfully after printing its integrity summary when a
+  CRC or trailer check fails.
+- `opensqlany slots` now reports directory entries in their physical order,
+  including deleted slots, rather than renumbering sorted live rows.
+- Partial Boolean-tail decoding rejects sidecars truncated after the row
+  header/null map, and exact materialized carriers reject trailing bytes.
+- Materialized table pages reject records whose offsets overlap the directory.
+- `PageStore::open` uses a checked, size-stable bounded read and revalidates
+  final size/alignment; same-length rewrites still require an immutable copy or
+  external locking.
+- Non-zero bytes before a slot directory are exposed as an unclassified prefix
+  rather than being claimed as row-continuation evidence.
+- Page-type classification keeps the raw on-disk byte available instead of
+  implying that lowercase variants can be reconstructed from the enum alone.
+- The documented development invocation now works in Windows PowerShell.
+
+### Changed
+
+- CI now tests the declared Rust 1.87 MSRV. The release workflow uses
+  crates.io trusted publishing via GitHub OIDC instead of a stored registry
+  token.
+
 ## [0.1.1] - 2026-08-12
 
 ### Added

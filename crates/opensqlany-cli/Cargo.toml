@@ -21,5 +21,8 @@ opensqlany.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 
+[dev-dependencies]
+crc32fast.workspace = true
+
 [lints]
 workspace = true

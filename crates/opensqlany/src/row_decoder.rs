@@ -639,6 +639,11 @@ pub enum DecodeError {
         /// Raw carrier flag byte.
         flags: u8,
     },
+    /// Bytes followed a materialized row carrier's declared boundary.
+    TrailingMaterializedRowCarrier {
+        /// Bytes outside the carrier's declared physical record.
+        remaining: usize,
+    },
     /// The requested one-based prefix ordinal is outside the supplied schema.
     PrefixOrdinalOutOfRange {
         /// Requested one-based ordinal.
@@ -725,6 +730,10 @@ impl fmt::Display for DecodeError {
             Self::UnsupportedMaterializedRowCarrierFlags { flags } => write!(
                 f,
                 "materialized row carrier has unsupported flags {flags:#04x}",
+            ),
+            Self::TrailingMaterializedRowCarrier { remaining } => write!(
+                f,
+                "materialized row carrier has {remaining} bytes after its declared boundary"
             ),
             Self::PrefixOrdinalOutOfRange {
                 ordinal,
@@ -1020,13 +1029,24 @@ pub fn decode_row_prefix_and_boolean_tail(
         | BooleanTailLayout::InlinePackedRunsLsbFirst
         | BooleanTailLayout::InlineU16Le => 0,
     };
-    let tail_start =
+    // The tail is relative to the physical row body, but the prefix starts
+    // after its header and null map.  Checking only `row.len()` would allow a
+    // malformed header to place the tail before the prefix, then underflow
+    // while computing the opaque middle length below.
+    let remaining_after_prefix =
         row.len()
-            .checked_sub(required_tail)
+            .checked_sub(cursor_start)
             .ok_or(DecodeError::TruncatedBooleanTail {
                 needed: required_tail,
-                remaining: row.len().saturating_sub(cursor_start),
+                remaining: 0,
             })?;
+    if required_tail > remaining_after_prefix {
+        return Err(DecodeError::TruncatedBooleanTail {
+            needed: required_tail,
+            remaining: remaining_after_prefix,
+        });
+    }
+    let tail_start = row.len() - required_tail;
     let mut cursor = cursor_start;
     let mut prefix_values = Vec::new();
     let mut boolean_values = Vec::new();
@@ -1127,7 +1147,11 @@ pub fn decode_row_prefix_and_boolean_tail(
         through_ordinal,
         prefix_values,
         boolean_values,
-        opaque_middle_len: tail_start - cursor,
+        opaque_middle_len: tail_start.checked_sub(cursor).ok_or(
+            DecodeError::PrefixOverlapsBooleanTail {
+                column: through - 1,
+            },
+        )?,
     })
 }
 
@@ -1147,6 +1171,11 @@ pub fn decode_materialized_row_record_exact(
         crate::RowSegmentError::MissingHeader { .. }
         | crate::RowSegmentError::InvalidLength { .. } => DecodeError::MissingRowHeader,
     })?;
+    if segment.declared_len() != input.len() {
+        return Err(DecodeError::TrailingMaterializedRowCarrier {
+            remaining: input.len() - segment.declared_len(),
+        });
+    }
     if segment.is_continued() {
         return Err(DecodeError::ContinuedMaterializedRowCarrier);
     }
@@ -1628,6 +1657,45 @@ mod tests {
         assert_eq!(
             decode_materialized_row_record_exact(&flagged, &schema),
             Err(DecodeError::UnsupportedMaterializedRowCarrierFlags { flags: 0x40 })
+        );
+        let mut trailing = input.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            decode_materialized_row_record_exact(&trailing, &schema),
+            Err(DecodeError::TrailingMaterializedRowCarrier { remaining: 1 })
+        );
+    }
+
+    #[test]
+    fn partial_decode_rejects_bytes_boolean_tail_truncated_after_null_bitmap() {
+        let columns = (0..9)
+            .map(|index| ColumnDef::new(index, "flag", ColumnType::Boolean, 0, true))
+            .collect();
+        let schema = RowSchema::new(columns);
+        // Two null-map bytes establish all nine values as present, but only
+        // one byte remains for the two-byte Boolean tail.
+        assert_eq!(
+            decode_row_prefix_and_boolean_tail(&row(&[0xff, 0x80, 1]), &schema, 1),
+            Err(DecodeError::TruncatedBooleanTail {
+                needed: 9,
+                remaining: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn partial_decode_rejects_packed_boolean_tail_truncated_after_null_bitmap() {
+        let columns = (0..9)
+            .map(|index| ColumnDef::new(index, "flag", ColumnType::Boolean, 0, true))
+            .collect();
+        let mut schema = RowSchema::new(columns);
+        schema.boolean_tail = BooleanTailLayout::PackedMsbFirst;
+        assert_eq!(
+            decode_row_prefix_and_boolean_tail(&row(&[0xff, 0x80, 0x80]), &schema, 1),
+            Err(DecodeError::TruncatedBooleanTail {
+                needed: 2,
+                remaining: 1,
+            })
         );
     }
 

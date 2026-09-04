@@ -10,7 +10,9 @@ The `opensqlany` binary is a thin inspector around the library API.
 ## inspect
 
 Show file shape and a per-page-type histogram. `--verify-crc`
-recomputes each page's CRC trailer.
+recomputes each page's CRC trailer. Both the superblock (page 0) and every
+ordinary page are checked. Any CRC or trailer failure is listed in the summary
+and makes the command exit unsuccessfully; use that exit status in automation.
 
 ```console
 $ opensqlany inspect database.db --verify-crc
@@ -26,6 +28,8 @@ page-type histogram:
   0x43 'C'  catalog           66    1.9%
   ...
 ```
+
+The histogram excludes the superblock, while `pages inspected` includes it.
 
 ## dump-page
 

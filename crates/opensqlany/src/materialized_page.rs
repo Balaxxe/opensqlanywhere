@@ -164,12 +164,19 @@ impl<'a> MaterializedTablePage<'a> {
         record_id: u16,
         directory_offset: u16,
     ) -> Result<(usize, &'a [u8]), MaterializedPageError> {
+        let directory_end = self.directory_end()?;
         let start = DIRECTORY_OFFSET
             .checked_add(usize::from(directory_offset))
             .ok_or(MaterializedPageError::RecordOutOfBounds {
                 record_id,
                 directory_offset,
             })?;
+        if start < directory_end {
+            return Err(MaterializedPageError::RecordOutOfBounds {
+                record_id,
+                directory_offset,
+            });
+        }
         let record_bytes =
             self.bytes
                 .get(start..)
@@ -509,6 +516,22 @@ mod tests {
                 directory_offset: relative_offset,
                 declared: 0,
                 available: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn eagerly_rejects_a_record_offset_inside_its_directory() {
+        let mut bytes = synthetic_page(1, 2);
+        // The two entries occupy 0x1c..0x20; a relative offset of two points
+        // at 0x1e, inside that directory rather than at a row body.
+        bytes[DIRECTORY_OFFSET..DIRECTORY_OFFSET + 2].copy_from_slice(&2_u16.to_le_bytes());
+
+        assert_eq!(
+            MaterializedTablePage::parse(&bytes),
+            Err(MaterializedPageError::RecordOutOfBounds {
+                record_id: 0,
+                directory_offset: 2,
             })
         );
     }

@@ -72,6 +72,10 @@ $ opensqlany ap-info Company.QBW
 $ opensqlany deob Company.QBW 2
 ```
 
+`inspect --verify-crc` verifies every page, including the superblock. It
+prints its findings and returns a non-zero status if any CRC or trailer check
+fails, making it suitable for integrity gates.
+
 ## Relationship to OpenQBW
 
 Intuit QuickBooks `.QBW` company files observed by this project use an

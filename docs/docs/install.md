@@ -34,3 +34,9 @@ cd OpenSQLAnywhere
 cargo build --release
 ./target/release/opensqlany --help
 ```
+
+On Windows PowerShell, run the `.exe` directly:
+
+```powershell
+.\target\release\opensqlany.exe --help
+```

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use opensqlany::{ApModel, PageStore, PageType, SlottedPage};
 
@@ -110,9 +110,13 @@ fn inspect(path: &std::path::Path, verify_crc: bool) -> Result<()> {
     let mut crc_failures: Vec<u64> = Vec::new();
     let mut trailer_failures: Vec<u64> = Vec::new();
 
-    for page in store.pages().skip(1) {
+    // Integrity verification covers the superblock too.  It is excluded from
+    // the type histogram because it is not an ordinary typed data page.
+    for page in store.pages() {
         let t = page.trailer();
-        *histogram.entry(t.page_type_raw).or_insert(0) += 1;
+        if page.index() != 0 {
+            *histogram.entry(t.page_type_raw).or_insert(0) += 1;
+        }
         if page.verify_trailer().is_err() {
             trailer_failures.push(page.index());
         }
@@ -122,7 +126,7 @@ fn inspect(path: &std::path::Path, verify_crc: bool) -> Result<()> {
     }
 
     println!();
-    println!("pages inspected   : {}", total.saturating_sub(1));
+    println!("pages inspected   : {} (including superblock)", total);
     if verify_crc {
         println!("crc failures      : {}", crc_failures.len());
         for pn in crc_failures.iter().take(10) {
@@ -154,6 +158,18 @@ fn inspect(path: &std::path::Path, verify_crc: bool) -> Result<()> {
             pct = 100.0 * count as f64 / denom,
         );
     }
+    let integrity_failures = crc_failures.len() + trailer_failures.len();
+    if integrity_failures != 0 {
+        bail!(
+            "integrity verification found {integrity_failures} failure(s){}",
+            if verify_crc {
+                " (CRC and trailer checks)"
+            } else {
+                " (trailer checks; pass --verify-crc to check CRCs too)"
+            }
+        );
+    }
+
     Ok(())
 }
 
@@ -214,7 +230,12 @@ fn slots(path: &std::path::Path, pn: u64) -> Result<()> {
                 println!("min row offset: 0x{:04X}", min);
             }
             println!();
-            for (i, (off, bytes)) in slotted.row_bytes().iter().enumerate().take(16) {
+            for slot in slot_rows(dir, page.bytes()).iter().take(16) {
+                let i = slot.index;
+                let Some((off, bytes)) = slot.row else {
+                    println!("  slot {i:>3}  deleted");
+                    continue;
+                };
                 let preview = bytes.iter().take(32).copied().collect::<Vec<_>>();
                 let hex = preview
                     .iter()
@@ -239,6 +260,46 @@ fn slots(path: &std::path::Path, pn: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A directory entry rendered by `slots`.  Unlike `SlottedPage::row_bytes`,
+/// this preserves physical directory order and includes deleted entries.
+#[derive(Debug, Clone, Copy)]
+struct SlotRow<'a> {
+    index: usize,
+    row: Option<(u16, &'a [u8])>,
+}
+
+fn slot_rows<'a>(directory: &opensqlany::SlotDirectory, page: &'a [u8]) -> Vec<SlotRow<'a>> {
+    const TRAILER_START: usize = 0xFF0;
+
+    // Boundaries depend on physical byte position rather than directory
+    // order, which descends.  Retain each entry's original position below.
+    let mut offsets: Vec<u16> = directory.live_slots().collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    directory
+        .slots
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, offset)| {
+            let row = if offset == 0 {
+                None
+            } else {
+                let start = offset as usize;
+                let end = offsets
+                    .iter()
+                    .position(|&candidate| candidate == offset)
+                    .and_then(|position| offsets.get(position + 1))
+                    .map(|next| *next as usize)
+                    .unwrap_or(TRAILER_START);
+                (start < end && end <= TRAILER_START).then(|| (offset, &page[start..end]))
+            };
+            SlotRow { index, row }
+        })
+        .collect()
 }
 
 fn ap_info(path: &std::path::Path) -> Result<()> {
@@ -303,5 +364,73 @@ fn hexdump(buf: &[u8], base: usize) {
             print!("{c}");
         }
         println!("|");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static NEXT_TEMP_FILE: AtomicUsize = AtomicUsize::new(0);
+
+    fn stamped_page(page_type: u8) -> [u8; 4096] {
+        let mut page = [0_u8; 4096];
+        page[0xFF2] = page_type;
+        let crc = crc32fast::hash(&page[..0xFFC]);
+        page[0xFFC..].copy_from_slice(&crc.to_le_bytes());
+        page
+    }
+
+    fn temporary_store(pages: &[[u8; 4096]]) -> PathBuf {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "opensqlany-cli-test-{}-{sequence}.db",
+            std::process::id()
+        ));
+        let mut bytes = Vec::with_capacity(pages.len() * 4096);
+        for page in pages {
+            bytes.extend_from_slice(page);
+        }
+        fs::write(&path, bytes).expect("write synthetic page store");
+        path
+    }
+
+    #[test]
+    fn inspect_verify_crc_rejects_a_bad_superblock_crc() {
+        let mut superblock = stamped_page(0);
+        superblock[0xFFC] ^= 1;
+        let path = temporary_store(&[superblock, stamped_page(b'E')]);
+
+        let error = inspect(&path, true).expect_err("bad page zero CRC must fail inspect");
+        assert!(error.to_string().contains("integrity verification"));
+        fs::remove_file(path).expect("remove synthetic page store");
+    }
+
+    #[test]
+    fn slot_rows_preserve_directory_order_and_deleted_entries() {
+        let directory = opensqlany::SlotDirectory {
+            scan_start: 0,
+            array_start: 0,
+            end: 8,
+            slots: vec![300, 0, 100, 200],
+            leading_zero: false,
+            big_endian: false,
+        };
+        let mut page = vec![0_u8; 4096];
+        page[100..200].fill(b'a');
+        page[200..300].fill(b'b');
+        page[300..0xFF0].fill(b'c');
+
+        let rows = slot_rows(&directory, &page);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].row.expect("live slot").0, 300);
+        assert!(rows[1].row.is_none());
+        assert_eq!(rows[2].row.expect("live slot").0, 100);
+        assert_eq!(rows[3].row.expect("live slot").0, 200);
+        assert_eq!(rows[2].row.expect("live slot").1.len(), 100);
+        assert_eq!(rows[3].row.expect("live slot").1.len(), 100);
     }
 }
